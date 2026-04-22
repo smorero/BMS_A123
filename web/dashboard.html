@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BMS A123 BLE Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #0d1117; color: #e6edf3; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    button { padding: 10px 14px; border: 0; border-radius: 8px; cursor: pointer; }
+    .btn-primary { background: #2f81f7; color: #fff; }
+    .btn-secondary { background: #30363d; color: #e6edf3; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+    .cell { background: #0f141b; border: 1px solid #30363d; border-radius: 8px; padding: 10px; }
+    .label { font-size: 12px; color: #8b949e; }
+    .value { font-size: 18px; font-weight: bold; margin-top: 4px; }
+    .ok { color: #3fb950; }
+    .warn { color: #d29922; }
+    .bad { color: #f85149; }
+    #status { font-weight: bold; }
+    code { background: #21262d; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>BMS A123 BLE Dashboard</h1>
+  <p>
+    Connects to the STM32 + X-NUCLEO-BNRG2A1 custom service
+    <code>0xA123</code> and reads 13 cell voltages + 13 temperatures via notifications.
+  </p>
+
+  <div class="row">
+    <button id="connectBtn" class="btn-primary">Connect BLE</button>
+    <button id="disconnectBtn" class="btn-secondary">Disconnect</button>
+    <button id="refreshBtn" class="btn-secondary">Refresh UI</button>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <div>Status: <span id="status">Idle</span></div>
+    <div>Device: <span id="deviceName">-</span></div>
+    <div>Updated: <span id="lastUpdate">-</span></div>
+    <div style="margin-top: 8px;">Web Bluetooth works on Chrome/Edge over HTTPS (or localhost).</div>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h3>Cell Voltages (mV)</h3>
+    <div id="voltages" class="grid"></div>
+  </div>
+
+  <div class="card">
+    <h3>Cell Temperatures (degC)</h3>
+    <div id="temperatures" class="grid"></div>
+  </div>
+
+  <script>
+    const CELL_COUNT = 13;
+    const SERVICE_UUID = 0xA123;
+    const VOLT_CHAR_UUID = 0xA124;
+    const TEMP_CHAR_UUID = 0xA125;
+
+    const state = {
+      device: null,
+      server: null,
+      voltages: new Array(CELL_COUNT).fill(null),
+      temperatures: new Array(CELL_COUNT).fill(null)
+    };
+
+    const statusEl = document.getElementById("status");
+    const deviceNameEl = document.getElementById("deviceName");
+    const lastUpdateEl = document.getElementById("lastUpdate");
+    const voltagesEl = document.getElementById("voltages");
+    const temperaturesEl = document.getElementById("temperatures");
+
+    function setStatus(text, cssClass = "") {
+      statusEl.textContent = text;
+      statusEl.className = cssClass;
+    }
+
+    function buildCards() {
+      voltagesEl.innerHTML = "";
+      temperaturesEl.innerHTML = "";
+
+      for (let i = 0; i < CELL_COUNT; i += 1) {
+        const vCard = document.createElement("div");
+        vCard.className = "cell";
+        vCard.id = `v-${i}`;
+        vCard.innerHTML = `<div class="label">Cell ${i + 1}</div><div class="value">-</div>`;
+        voltagesEl.appendChild(vCard);
+
+        const tCard = document.createElement("div");
+        tCard.className = "cell";
+        tCard.id = `t-${i}`;
+        tCard.innerHTML = `<div class="label">Cell ${i + 1}</div><div class="value">-</div>`;
+        temperaturesEl.appendChild(tCard);
+      }
+    }
+
+    function voltageClass(mv) {
+      if (mv < 3000 || mv > 3800) return "bad";
+      if (mv < 3150 || mv > 3600) return "warn";
+      return "ok";
+    }
+
+    function temperatureClass(tc) {
+      if (tc < 0 || tc > 60) return "bad";
+      if (tc < 10 || tc > 45) return "warn";
+      return "ok";
+    }
+
+    function render() {
+      for (let i = 0; i < CELL_COUNT; i += 1) {
+        const v = state.voltages[i];
+        const t = state.temperatures[i];
+
+        const vValue = document.querySelector(`#v-${i} .value`);
+        const tValue = document.querySelector(`#t-${i} .value`);
+
+        if (v === null) {
+          vValue.textContent = "-";
+          vValue.className = "value";
+        } else {
+          vValue.textContent = `${v} mV`;
+          vValue.className = `value ${voltageClass(v)}`;
+        }
+
+        if (t === null) {
+          tValue.textContent = "-";
+          tValue.className = "value";
+        } else {
+          tValue.textContent = `${t.toFixed(1)} C`;
+          tValue.className = `value ${temperatureClass(t)}`;
+        }
+      }
+    }
+
+    function parseUint16Array(dataview) {
+      const out = [];
+      for (let i = 0; i < CELL_COUNT; i += 1) {
+        out.push(dataview.getUint16(i * 2, true));
+      }
+      return out;
+    }
+
+    function parseInt16Array(dataview) {
+      const out = [];
+      for (let i = 0; i < CELL_COUNT; i += 1) {
+        out.push(dataview.getInt16(i * 2, true) / 10.0);
+      }
+      return out;
+    }
+
+    function onVoltageNotification(event) {
+      const dv = event.target.value;
+      if (dv.byteLength !== CELL_COUNT * 2) return;
+      state.voltages = parseUint16Array(dv);
+      lastUpdateEl.textContent = new Date().toLocaleTimeString();
+      render();
+    }
+
+    function onTempNotification(event) {
+      const dv = event.target.value;
+      if (dv.byteLength !== CELL_COUNT * 2) return;
+      state.temperatures = parseInt16Array(dv);
+      lastUpdateEl.textContent = new Date().toLocaleTimeString();
+      render();
+    }
+
+    async function connect() {
+      try {
+        setStatus("Requesting device...");
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE_UUID] }]
+        });
+
+        device.addEventListener("gattserverdisconnected", () => {
+          setStatus("Disconnected", "warn");
+          deviceNameEl.textContent = "-";
+        });
+
+        setStatus("Connecting...");
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        const voltageChar = await service.getCharacteristic(VOLT_CHAR_UUID);
+        const tempChar = await service.getCharacteristic(TEMP_CHAR_UUID);
+
+        await voltageChar.startNotifications();
+        await tempChar.startNotifications();
+        voltageChar.addEventListener("characteristicvaluechanged", onVoltageNotification);
+        tempChar.addEventListener("characteristicvaluechanged", onTempNotification);
+
+        state.device = device;
+        state.server = server;
+        deviceNameEl.textContent = device.name || "(unnamed)";
+        setStatus("Connected", "ok");
+      } catch (err) {
+        setStatus(`Error: ${err.message}`, "bad");
+      }
+    }
+
+    function disconnect() {
+      if (state.device && state.device.gatt.connected) {
+        state.device.gatt.disconnect();
+      }
+    }
+
+    document.getElementById("connectBtn").addEventListener("click", connect);
+    document.getElementById("disconnectBtn").addEventListener("click", disconnect);
+    document.getElementById("refreshBtn").addEventListener("click", render);
+
+    buildCards();
+    render();
+  </script>
+</body>
+</html>
