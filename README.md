@@ -56,6 +56,18 @@ Notes:
 - Web Bluetooth requires HTTPS (or localhost).
 - iOS Safari does not support Web Bluetooth.
 
+## One-click update from GitHub (Windows)
+
+This repository includes `update_from_github.bat`.
+
+Double-click it (or run from PowerShell/cmd) inside the project folder to:
+
+- fetch latest `origin/main`
+- reset local `main` to match GitHub exactly
+- remove untracked files/folders
+
+Use it when you want a clean local copy that matches repository state exactly.
+
 ## Next step when sensor SPI details are ready
 
 Replace the stub generator in:

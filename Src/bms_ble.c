@@ -51,22 +51,26 @@ typedef struct {
 
 #define RCC_BASE                     0x40021000UL
 #define GPIOA_BASE                   0x48000000UL
+#define GPIOB_BASE                   0x48000400UL
 #define SPI1_BASE                    0x40013000UL
 #define SCB_CPACR_ADDR               0xE000ED88UL
 #define SYSTICK_BASE                 0xE000E010UL
 
 #define RCC                          ((RCC_TypeDef *)RCC_BASE)
 #define GPIOA                        ((GPIO_TypeDef *)GPIOA_BASE)
+#define GPIOB                        ((GPIO_TypeDef *)GPIOB_BASE)
 #define SPI1                         ((SPI_TypeDef *)SPI1_BASE)
 #define SysTick                      ((SysTick_TypeDef *)SYSTICK_BASE)
 #define SCB_CPACR                    (*(volatile uint32_t *)SCB_CPACR_ADDR)
 
 #define RCC_AHBENR_GPIOAEN           (1UL << 17)
+#define RCC_AHBENR_GPIOBEN           (1UL << 18)
 #define RCC_APB2ENR_SYSCFGEN         (1UL << 0)
 #define RCC_APB2ENR_SPI1EN           (1UL << 12)
 
 #define SPI_CR1_CPHA                 (1UL << 0)
 #define SPI_CR1_MSTR                 (1UL << 2)
+#define SPI_CR1_BR_0                 (1UL << 3)
 #define SPI_CR1_BR_1                 (1UL << 4)
 #define SPI_CR1_SPE                  (1UL << 6)
 #define SPI_CR1_SSI                  (1UL << 8)
@@ -87,8 +91,9 @@ typedef struct {
 
 #define BLE_SPI_HEADER_SIZE         5U
 #define BLE_MAX_FRAME_SIZE          260U
-#define BLE_CMD_TIMEOUT_MS          300U
-#define BLE_SPI_TIMEOUT_MS          20U
+#define BLE_CMD_TIMEOUT_MS          1000U
+#define BLE_SPI_TIMEOUT_MS          40U
+#define BLE_INIT_RETRIES            3U
 
 #define BLE_ADVERT_RETRY_MS         1000U
 #define BLE_PUBLISH_PERIOD_MS       1000U
@@ -147,8 +152,15 @@ typedef struct {
 #define BNRG_IRQ_PIN                0U   /* A0 */
 #define BNRG_CS_PORT                GPIOA
 #define BNRG_CS_PIN                 1U   /* A1 */
+#define BNRG_CS_ALT_PORT            GPIOB
+#define BNRG_CS_ALT_PIN             6U   /* D10 fallback */
 #define BNRG_RST_PORT               GPIOA
 #define BNRG_RST_PIN                8U   /* D7 */
+
+typedef struct {
+  GPIO_TypeDef *port;
+  uint8_t pin;
+} ble_cs_line_t;
 
 static volatile uint32_t s_tick_ms;
 
@@ -172,6 +184,11 @@ static uint32_t s_last_publish_ms;
 static uint32_t s_last_adv_attempt_ms;
 
 static const uint8_t s_device_name[] = "BMS-A123";
+static ble_cs_line_t s_cs_line = {BNRG_CS_PORT, BNRG_CS_PIN};
+static const ble_cs_line_t s_cs_candidates[] = {
+    {BNRG_CS_PORT, BNRG_CS_PIN},
+    {BNRG_CS_ALT_PORT, BNRG_CS_ALT_PIN},
+};
 
 static uint32_t ble_millis(void);
 static bool ble_elapsed(uint32_t start_ms, uint32_t timeout_ms);
@@ -181,6 +198,7 @@ static void ble_gpio_spi_init(void);
 static void ble_spi1_init(void);
 static void ble_spi1_select(void);
 static void ble_spi1_deselect(void);
+static void ble_set_active_cs(const ble_cs_line_t *line);
 static bool ble_spi1_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len);
 static bool ble_wait_irq_high(uint32_t timeout_ms);
 static bool ble_is_irq_high(void);
@@ -222,6 +240,10 @@ void SysTick_Handler(void)
 
 int bms_ble_init(void)
 {
+  uint32_t cs_idx;
+  uint32_t retry_idx;
+  bool stack_ok;
+
   memset(s_cell_voltage_mv, 0, sizeof(s_cell_voltage_mv));
   memset(s_cell_temp_deci_c, 0, sizeof(s_cell_temp_deci_c));
 
@@ -235,10 +257,28 @@ int bms_ble_init(void)
   s_wave_step = 0U;
 
   ble_gpio_spi_init();
-  ble_reset_module();
-  ble_delay_ms(10U);
 
-  if (ble_stack_init() != 0) {
+  stack_ok = false;
+  for (cs_idx = 0U; cs_idx < (sizeof(s_cs_candidates) / sizeof(s_cs_candidates[0])); cs_idx++) {
+    ble_set_active_cs(&s_cs_candidates[cs_idx]);
+    ble_reset_module();
+    ble_delay_ms(40U);
+
+    for (retry_idx = 0U; retry_idx < BLE_INIT_RETRIES; retry_idx++) {
+      if (ble_stack_init() == 0) {
+        stack_ok = true;
+        break;
+      }
+      ble_reset_module();
+      ble_delay_ms(40U);
+    }
+
+    if (stack_ok) {
+      break;
+    }
+  }
+
+  if (!stack_ok) {
     return -1;
   }
 
@@ -307,7 +347,7 @@ static void ble_delay_ms(uint32_t delay_ms)
 
 static void ble_gpio_spi_init(void)
 {
-  RCC->AHBENR |= RCC_AHBENR_GPIOAEN;
+  RCC->AHBENR |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_GPIOBEN;
   RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
   (void)RCC->AHBENR;
   (void)RCC->APB2ENR;
@@ -324,6 +364,12 @@ static void ble_gpio_spi_init(void)
   GPIOA->MODER |= (1U << (BNRG_CS_PIN * 2U));
   GPIOA->OTYPER &= ~(1U << BNRG_CS_PIN);
   GPIOA->BSRR = (1U << BNRG_CS_PIN);
+
+  /* PB6 alternate chip-select output (D10 fallback) */
+  GPIOB->MODER &= ~(3U << (BNRG_CS_ALT_PIN * 2U));
+  GPIOB->MODER |= (1U << (BNRG_CS_ALT_PIN * 2U));
+  GPIOB->OTYPER &= ~(1U << BNRG_CS_ALT_PIN);
+  GPIOB->BSRR = (1U << BNRG_CS_ALT_PIN);
 
   /* PA8 reset output */
   GPIOA->MODER &= ~(3U << (BNRG_RST_PIN * 2U));
@@ -346,20 +392,28 @@ static void ble_spi1_init(void)
   SPI1->CR1 = 0U;
   SPI1->CR2 = 0U;
 
-  /* SPI mode 1, master, software NSS, <=1 MHz when SYSCLK is 8 MHz. */
-  SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_BR_1 | SPI_CR1_CPHA;
+  /* SPI mode 1, master, software NSS, ~500 kHz when SYSCLK is 8 MHz. */
+  SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_BR_1 | SPI_CR1_BR_0 | SPI_CR1_CPHA;
   SPI1->CR2 = (7U << SPI_CR2_DS_Pos) | SPI_CR2_FRXTH;
   SPI1->CR1 |= SPI_CR1_SPE;
 }
 
+static void ble_set_active_cs(const ble_cs_line_t *line)
+{
+  if (line == NULL) {
+    return;
+  }
+  s_cs_line = *line;
+}
+
 static void ble_spi1_select(void)
 {
-  BNRG_CS_PORT->BSRR = (1U << (BNRG_CS_PIN + 16U));
+  s_cs_line.port->BSRR = (1U << (s_cs_line.pin + 16U));
 }
 
 static void ble_spi1_deselect(void)
 {
-  BNRG_CS_PORT->BSRR = (1U << BNRG_CS_PIN);
+  s_cs_line.port->BSRR = (1U << s_cs_line.pin);
 }
 
 static bool ble_spi1_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len)
@@ -417,9 +471,9 @@ static void ble_reset_module(void)
 {
   ble_spi1_deselect();
   BNRG_RST_PORT->BSRR = (1U << (BNRG_RST_PIN + 16U));
-  ble_delay_ms(5U);
+  ble_delay_ms(20U);
   BNRG_RST_PORT->BSRR = (1U << BNRG_RST_PIN);
-  ble_delay_ms(5U);
+  ble_delay_ms(20U);
 }
 
 static bool bluenrg_spi_write(const uint8_t *data, uint16_t len)
@@ -627,9 +681,17 @@ static int ble_stack_init(void)
   uint8_t params_len;
 
   int rc;
+  uint32_t retry_idx;
 
   /* Standard HCI reset (opcode 0x0C03). */
-  rc = hci_send_cmd_sync(HCI_OPCODE(OGF_HOST_CTL, OCF_RESET), NULL, 0U, rp, &rp_len);
+  rc = -1;
+  for (retry_idx = 0U; retry_idx < BLE_INIT_RETRIES; retry_idx++) {
+    rc = hci_send_cmd_sync(HCI_OPCODE(OGF_HOST_CTL, OCF_RESET), NULL, 0U, rp, &rp_len);
+    if (rc == 0) {
+      break;
+    }
+    ble_delay_ms(20U);
+  }
   if (rc != 0) {
     return rc;
   }
