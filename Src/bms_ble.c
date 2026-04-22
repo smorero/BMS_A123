@@ -94,6 +94,8 @@ typedef struct {
 #define BLE_CMD_TIMEOUT_MS          1000U
 #define BLE_SPI_TIMEOUT_MS          40U
 #define BLE_INIT_RETRIES            3U
+#define BLE_WRITE_POLL_RETRIES      64U
+#define BLE_READ_POLL_BUDGET        8U
 
 #define BLE_ADVERT_RETRY_MS         1000U
 #define BLE_PUBLISH_PERIOD_MS       1000U
@@ -200,8 +202,6 @@ static void ble_spi1_select(void);
 static void ble_spi1_deselect(void);
 static void ble_set_active_cs(const ble_cs_line_t *line);
 static bool ble_spi1_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len);
-static bool ble_wait_irq_high(uint32_t timeout_ms);
-static bool ble_is_irq_high(void);
 static void ble_reset_module(void);
 
 static bool bluenrg_spi_write(const uint8_t *data, uint16_t len);
@@ -451,22 +451,6 @@ static bool ble_spi1_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len)
   return true;
 }
 
-static bool ble_wait_irq_high(uint32_t timeout_ms)
-{
-  uint32_t start = ble_millis();
-  while (!ble_is_irq_high()) {
-    if (ble_elapsed(start, timeout_ms)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-static bool ble_is_irq_high(void)
-{
-  return (BNRG_IRQ_PORT->IDR & (1U << BNRG_IRQ_PIN)) != 0U;
-}
-
 static void ble_reset_module(void)
 {
   ble_spi1_deselect();
@@ -482,28 +466,29 @@ static bool bluenrg_spi_write(const uint8_t *data, uint16_t len)
   uint8_t hdr_rx[BLE_SPI_HEADER_SIZE];
   uint16_t writable;
   bool ok;
+  uint32_t attempt;
 
-  if (!ble_wait_irq_high(BLE_CMD_TIMEOUT_MS)) {
-    return false;
-  }
+  for (attempt = 0U; attempt < BLE_WRITE_POLL_RETRIES; attempt++) {
+    ble_spi1_select();
 
-  ble_spi1_select();
+    ok = ble_spi1_transfer(hdr_tx, hdr_rx, BLE_SPI_HEADER_SIZE);
+    if (!ok) {
+      ble_spi1_deselect();
+      return false;
+    }
 
-  ok = ble_spi1_transfer(hdr_tx, hdr_rx, BLE_SPI_HEADER_SIZE);
-  if (!ok) {
+    writable = (uint16_t)hdr_rx[1] | ((uint16_t)hdr_rx[2] << 8);
+    if ((hdr_rx[0] == 0x02U) && (writable >= len)) {
+      ok = ble_spi1_transfer(data, NULL, len);
+      ble_spi1_deselect();
+      return ok;
+    }
+
     ble_spi1_deselect();
-    return false;
+    ble_delay_ms(1U);
   }
 
-  writable = (uint16_t)hdr_rx[1] | ((uint16_t)hdr_rx[2] << 8);
-  if ((hdr_rx[0] != 0x02U) || (writable < len)) {
-    ble_spi1_deselect();
-    return false;
-  }
-
-  ok = ble_spi1_transfer(data, NULL, len);
-  ble_spi1_deselect();
-  return ok;
+  return false;
 }
 
 static uint16_t bluenrg_spi_read(uint8_t *buffer, uint16_t max_len)
@@ -514,10 +499,6 @@ static uint16_t bluenrg_spi_read(uint8_t *buffer, uint16_t max_len)
   uint16_t to_copy;
   uint16_t i;
   uint8_t rx_byte;
-
-  if (!ble_is_irq_high()) {
-    return 0U;
-  }
 
   ble_spi1_select();
 
@@ -661,8 +642,9 @@ static void ble_drain_events(void)
 {
   uint8_t packet[BLE_MAX_FRAME_SIZE];
   uint16_t len;
+  uint32_t poll_count;
 
-  while (ble_is_irq_high()) {
+  for (poll_count = 0U; poll_count < BLE_READ_POLL_BUDGET; poll_count++) {
     len = bluenrg_spi_read(packet, sizeof(packet));
     if (len == 0U) {
       break;
